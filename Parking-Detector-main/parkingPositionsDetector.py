@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 from shapely.geometry import Point, Polygon
 from tracker import *
-
+FREE_COLOR     = (0, 255, 0)   # зелёный
+OCCUPIED_COLOR = (0,   0, 255) # красный
 
 class Detector:
     def __init__(self, stream, db):
@@ -77,7 +78,6 @@ class Detector:
                     self.__parkingPositions.pop(i)
                     self.__db.deleteParkingPosition(pos[0], pos[1], pos[2], pos[3])
 
-
     # ****************************
     # end marking Area functions
     # ****************************
@@ -106,9 +106,13 @@ class Detector:
 
 
     # Draw Parking Positions
-    def __drawParkingPositions(self, img):
-        for pos in self.__parkingPositions:
-            cv2.rectangle(img, (pos[0], pos[1]), (pos[0] + pos[2], pos[1] + pos[3]), (0, 191, 255), 2)
+    def __drawParkingPositions(self, img, occupied_flags=None):
+     for idx, (x, y, w, h) in enumerate(self.__parkingPositions):
+        if occupied_flags:
+            color = OCCUPIED_COLOR if occupied_flags[idx] else FREE_COLOR
+        else:
+            color = (0, 191, 255)  # прежний жёлтый
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
 
 
     # Parking positions detection algorithm
@@ -121,6 +125,8 @@ class Detector:
             else:
                 view_frame = frame.copy()
 
+                occupied_flags = [False] * len(self.__parkingPositions)
+
                 potentialParkingPositions = []
 
                 imgBlur = cv2.GaussianBlur(frame, (51, 51), 2)
@@ -130,7 +136,7 @@ class Detector:
                 kernel = np.ones((5, 5), np.uint8)
                 imgDilate = cv2.dilate(mask, kernel, iterations=2)
 
-                self.__drawParkingPositions(view_frame)
+                self.__drawParkingPositions(view_frame, occupied_flags)
                 self.__drawParkingAreas(view_frame)
 
                 contours, _ = cv2.findContours(imgDilate, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -139,10 +145,27 @@ class Detector:
                     area = cv2.contourArea(cnt)
                     (x, y, w, h) = cv2.boundingRect(cnt)
                     print(f"Контур: x={x}, y={y}, w={w}, h={h}, area={area}")
-                    if area > 2000:
-                        self.__addPotentialParkingPositions(x, y, w, h, potentialParkingPositions)
-                        cv2.rectangle(view_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(view_frame, str(area), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    if area > 800:
+                        if self.__addPotentialParkingPositions(x, y, w, h, potentialParkingPositions):
+                            cv2.rectangle(view_frame, (x, y), (x + w, y + h), OCCUPIED_COLOR, 2)
+                            cv2.putText(view_frame, str(area), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                
+                                # --------------------- вычисляем занятость ---------------------
+                occupied_flags = []                      # True / False для каждого слота
+                for sx, sy, sw, sh in self.__parkingPositions:
+                    # центр слота
+                    slot_center = Point(sx + sw / 2, sy + sh / 2)
+                    busy = False
+                    # проверяем, попала ли хоть одна машина в слот
+                    for cx, cy, cw, ch in potentialParkingPositions:
+                        car_center = Point(cx + cw / 2, cy + ch / 2)
+                        # достаточно, чтобы центры были близко (быстро) или
+                        # чтобы car-прямоугольник пересёкся со slot-прямоугольником (надёжнее)
+                        if slot_center.distance(car_center) < max(sw, sh)/4:
+                            busy = True
+                            break
+                    occupied_flags.append(busy)
+
 
                 self.__tracker.update(potentialParkingPositions)
                 newParkingPositions = self.__tracker.getOptimalParkingPositions()

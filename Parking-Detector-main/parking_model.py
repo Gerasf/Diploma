@@ -1,3 +1,6 @@
+from logger import write_yolo_boxes, write_slot_state
+from datetime import datetime
+from constants import FREE_COLOR, OCCUPIED_COLOR
 import cv2
 import pickle
 import threading
@@ -6,7 +9,18 @@ import torch.hub
 import pandas
 import numpy as np
 import multiprocessing as mp
-
+# ───────── Intersection-over-Union ───────────────────────────────
+def _iou(a, b):
+    """a, b → (x1, y1, x2, y2)  →  IoU ∈ [0,1]"""
+    xA, yA = max(a[0], b[0]), max(a[1], b[1])
+    xB, yB = min(a[2], b[2]), min(a[3], b[3])
+    inter  = max(0, xB - xA) * max(0, yB - yA)
+    if inter == 0:
+        return 0.0
+    areaA  = (a[2]-a[0]) * (a[3]-a[1])
+    areaB  = (b[2]-b[0]) * (b[3]-b[1])
+    return inter / (areaA + areaB - inter)
+# ────────────────────────────────────────────────────────────────
 
 class Model:
     def __init__(self, stream, db, weights):
@@ -20,6 +34,14 @@ class Model:
         self.__db = db
         self.__parkingAreas = self.__db.getParkingArea()
         self.__poslist = self.__db.getParkingPositions()
+        self.__poslist_xyxy = []
+        for slot in self.__poslist:        # slot = (x, y, w, h)  ***если getParkingPositions
+                                        # уже возвращает id, поправьте на slot[1] … slot[4]
+            x, y, w, h = slot[0], slot[1], slot[2], slot[3]
+            slot_id    = slot[4] if len(slot) > 4 else None   # <- id из БД, если есть
+            self.__poslist_xyxy.append(
+                dict(id=slot_id, x1=x, y1=y, x2=x+w, y2=y+h)
+            )
 
     def __intersecting(self, position, positionList):
         if len(positionList) == 0:
@@ -91,15 +113,10 @@ class Model:
             imgCrop = imgPro[pos[1]:pos[1] + pos[3], pos[0]:pos[0] + pos[2]]
 
             # if less than 250 free -> color green else color red
-            if pos[4] == 0:
-                color = (0, 255, 0)
-                thickness = 4
-
-                # a lock might be needed for this
-                # freeSpaces += 1
-            else:
-                color = (0, 0, 255)
-                thickness = 2
+            if pos[4] == 0:                   # свободно
+                color, thickness = FREE_COLOR, 4
+                freeSpaces += 1
+                color, thickness = OCCUPIED_COLOR, 2
             cv2.rectangle(frame, (pos[0], pos[1]), (pos[0] + pos[2], pos[1] + pos[3]), color, thickness)
         self.__freeSpaces = freeSpaces
 
@@ -117,9 +134,8 @@ class Model:
             p4 = Point(x + w, y + h)
             if p1.within(poly) and p2.within(poly) and p3.within(poly) and p4.within(poly):
                 potentialParkingPositions.append([x, y, w, h])
-                print(f"Добавлена потенциальная позиция: [{x}, {y}, {w}, {h}] внутри {coord}")
-            else:
-                print(f"Позиция [{x}, {y}, {w}, {h}] не входит в зону {coord}")
+                return True
+        return False
 
     def __split_and_process_image(self, imgPro, numberOfParts):
         h, w = imgPro.shape
@@ -166,6 +182,42 @@ class Model:
         # get all occupied positions by cars using yolov5
         self.__model.conf = 0.3
         occupied = self.__model(imgPro)
+        # ───────────── сохранение предсказаний YOLO ─────────────────────
+        ts = datetime.utcnow()           # timestamp для обеих таблиц
+
+        # YOLO-вывод → list[(x1,y1,x2,y2,conf)]
+        boxes = []
+        for *xyxy, conf, cls in occupied.xyxy[0].tolist():
+             x1, y1, x2, y2 = map(int, xyxy)
+             boxes.append((x1, y1, x2, y2, float(conf)))
+
+           # подчёркиваем на кадре только машины/грузовики
+             if self.__model.names[int(cls)] in ('car', 'truck'):
+                cv2.rectangle(frame, (x1, y1), (x2, y2), OCCUPIED_COLOR, 2)
+
+
+
+        # 1) все рамки → detection_log
+        write_yolo_boxes(ts, boxes)
+
+        # 2) рассчитываем, занят/свободен каждый слот
+                # гарантируем уникальный id даже если в БД None
+        occupied_dict = {}
+        for idx, slot in enumerate(self.__poslist_xyxy, start=1):
+            slot_id = slot['id'] or idx
+            slot['id'] = slot_id          # сохраняем обратно
+            occupied_dict[slot_id] = False
+
+        for x1, y1, x2, y2, _ in boxes:
+            for slot in self.__poslist_xyxy:
+                if _iou((x1, y1, x2, y2),
+                        (slot['x1'], slot['y1'], slot['x2'], slot['y2'])) >= 0.5:
+                    occupied_dict[slot['id']] = True
+
+        # 3) пишем результат → slot_state_log
+        write_slot_state(ts, occupied_dict)
+        # ────────────────────────────────────────────────────────────────
+
         self.__getOccupiedPositions(occupied, occupiedPositions)
         # *******************************************************
 

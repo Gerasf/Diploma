@@ -32,7 +32,7 @@ def info():
     return jsonify(totalSpaces_value=totalSpaces, freeSpaces_value=freeSpaces)
 
 if __name__ == "__main__":
-    stream = 'testvideo3.MOV'
+    stream = 'C:\\vkr\\diplom\\Parking-Detector-main\\testvideo4.MOV'
     # stream = 'http://eitancamhome:eitancamhome@10.100.102.10:6677/video'
 
     # Create an instance of the DbHandler
